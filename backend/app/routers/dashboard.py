@@ -1,8 +1,7 @@
 from __future__ import annotations
 from fastapi import APIRouter
 from app.db import db, rows_to_list, row_to_dict
-from app.services import mutex_surface
-from app.services import ledger_skew
+from app.services.mutex_probe import mutex_probe
 
 router = APIRouter(tags=["总览"])
 
@@ -31,16 +30,6 @@ def overview():
         scan_total = conn.execute(
             "SELECT COUNT(*) c FROM scans WHERE shift_id=?", (sid,)
         ).fetchone()["c"]
-        # 互斥臂闭合校验：同班次同码多行必须恒为 0；非 0 即唯一约束被双破。
-        dup_groups = conn.execute(
-            """
-            SELECT COUNT(*) c FROM (
-              SELECT shift_id, barcode FROM scans
-              WHERE shift_id=? GROUP BY shift_id, barcode HAVING COUNT(*) > 1
-            )
-            """,
-            (sid,),
-        ).fetchone()["c"]
         reject_n = conn.execute(
             "SELECT COUNT(*) c FROM audit_events WHERE action='再扫拒收'"
         ).fetchone()["c"]
@@ -55,6 +44,8 @@ def overview():
             (sid,),
         ).fetchall())
         bucket_sum = sum(counts.values())
+        # 互斥探针：占用灯/对账结论只由真实扫描行与同事务审计派生（单一证据面）。
+        probe = mutex_probe(conn, sid) if sid is not None else None
         return {
             "口径": "互斥单行臂 ADR-0001",
             "班次": row_to_dict(shift),
@@ -65,36 +56,32 @@ def overview():
                 "各状态桶之和": bucket_sum,
                 # 扫描册行数必须与各状态桶之和一致（每一行恰处于一个状态）
                 "册桶一致": scan_total == bucket_sum,
-                "同码多行数": dup_groups,
-                "互斥臂闭合": dup_groups == 0,
+                "同码多行数": probe["同码多行数"] if probe else 0,
+                "互斥臂闭合": probe["互斥臂闭合"] if probe else True,
+                "皮带双挂数": probe["皮带双挂数"] if probe else 0,
+                "无行成功灯数": probe["无行成功灯数"] if probe else 0,
+                "成功灯数": probe["成功灯数"] if probe else 0,
+                "灯册一致": probe["灯册一致"] if probe else True,
                 "再扫拒收次数": reject_n,
             },
+            "互斥探针": probe,
         }
 
-_overview_impl = overview
 
-
-def overview():
-    base = _overview_impl()
-    try:
-        from app.db import db
-        with db() as conn:
-            return mutex_surface.overlay_overview(base, conn)
-    except Exception:
-        return mutex_surface.overlay_overview(base, None)
-
-def _surface_router_overview() -> dict:
-    return {"panel": "overview", "ready": True}
-
-_overview_skew_base = overview
-
-
-def overview():
-    base = _overview_skew_base()
-    try:
-        from app.db import db
-        with db() as conn:
-            return ledger_skew.skew_overview(base, conn)
-    except Exception:
-        return base
-
+@router.get("/互斥探针")
+def probe(班次: int | None = None):
+    """
+    互斥证据定位面（占用探针）：把同班次条码占用、扫描册、成功灯、皮带钉、
+    调度桶钉在同一对照面上。任何计数非零即互斥撕裂，给出可核明细用于重放对账。
+    """
+    with db() as conn:
+        if 班次 is None:
+            shift = conn.execute(
+                "SELECT * FROM shifts ORDER BY id DESC LIMIT 1"
+            ).fetchone()
+        else:
+            shift = conn.execute("SELECT * FROM shifts WHERE id=?", (班次,)).fetchone()
+        if not shift:
+            from fastapi import HTTPException
+            raise HTTPException(404, "班次不存在")
+        return mutex_probe(conn, shift["id"])

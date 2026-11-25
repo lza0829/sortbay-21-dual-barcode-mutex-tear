@@ -3,6 +3,7 @@ from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel, Field
 from app.db import db, write_db, rows_to_list, row_to_dict
 from app.services.common import audit, now_str
+from app.services.mutex_probe import mutex_probe
 
 router = APIRouter(tags=["班次"])
 
@@ -44,16 +45,6 @@ def reconcile(shift_id: int | None = None):
             "SELECT COUNT(*) c FROM scans WHERE shift_id=? AND status IN ('待路由','错分回流')",
             (sid,),
         ).fetchone()["c"]
-        # ADR-0001 互斥单行臂：同班次同码多行恒为 0，否则视为未闭合。
-        dup_groups = conn.execute(
-            """
-            SELECT COUNT(*) c FROM (
-              SELECT barcode FROM scans WHERE shift_id=?
-              GROUP BY barcode HAVING COUNT(*) > 1
-            )
-            """,
-            (sid,),
-        ).fetchone()["c"]
         reject_n = conn.execute(
             """
             SELECT COUNT(*) c FROM audit_events
@@ -63,6 +54,8 @@ def reconcile(shift_id: int | None = None):
             """,
             (sid,),
         ).fetchone()["c"]
+        # 同一互斥探针面：班次对账与总览、占用灯、重放共用同一证据口径。
+        probe = mutex_probe(conn, sid)
         return {
             "口径": "互斥单行臂 ADR-0001",
             "班次": row_to_dict(shift),
@@ -72,8 +65,13 @@ def reconcile(shift_id: int | None = None):
             "已封袋数": sealed_bag,
             "回流批次数": divert_n,
             "未清件数": pending,
-            "同码多行数": dup_groups,
-            "互斥臂闭合": dup_groups == 0,
+            "同码多行数": probe["同码多行数"],
+            "皮带双挂数": probe["皮带双挂数"],
+            "无行成功灯数": probe["无行成功灯数"],
+            "成功灯数": probe["成功灯数"],
+            "灯册一致": probe["灯册一致"],
+            "桶册一致": probe["桶册一致"],
+            "互斥臂闭合": probe["互斥臂闭合"],
             "再扫拒收次数": reject_n,
         }
 
@@ -119,7 +117,4 @@ def seal_shift(shift_id: int):
         )
         audit(conn, "班次", shift_id, "封班", "")
         return row_to_dict(conn.execute("SELECT * FROM shifts WHERE id=?", (shift_id,)).fetchone())
-
-def _surface_router_shifts() -> dict:
-    return {"panel": "shifts", "ready": True}
 

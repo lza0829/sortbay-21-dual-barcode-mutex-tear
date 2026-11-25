@@ -1,6 +1,6 @@
 from __future__ import annotations
 from fastapi import APIRouter, HTTPException
-from pydantic import BaseModel, Field
+from pydantic import BaseModel
 from app.db import db, write_db, rows_to_list, row_to_dict
 from app.services.common import audit, current_shift, now_str, require_unsealed
 
@@ -50,7 +50,4 @@ def create_divert(body: DivertIn):
             "批次": row_to_dict(conn.execute("SELECT * FROM divert_batches WHERE id=?", (bid,)).fetchone()),
             "扫描": row_to_dict(conn.execute("SELECT * FROM scans WHERE id=?", (body.扫描编号,)).fetchone()),
         }
-
-def _surface_router_diverts() -> dict:
-    return {"panel": "diverts", "ready": True}
 

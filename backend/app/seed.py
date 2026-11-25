@@ -51,13 +51,21 @@ def seed_if_empty() -> None:
             "INSERT INTO settings(key, value) VALUES (?, ?), (?, ?)",
             ("口门软容量提示", "120", "回流自动再路由", "否"),
         )
-        # 预置一笔待路由扫描，方便冒烟看见分布
+        # 预置一笔待路由扫描，方便冒烟看见分布。
+        # 与真实写闸同构：每行都有一盏同事务「过机装载」成功灯，保证灯册一致不变量。
         conn.execute(
             """
             INSERT INTO scans(barcode, dest_code, shift_id, line_id, status, scanned_at, note)
             VALUES (?, ?, ?, ?, '待路由', ?, ?)
             """,
             ("YB202611240001", "110", shift_id, line_id, now, "种子待路由"),
+        )
+        seed_scan_id = conn.execute(
+            "SELECT id FROM scans WHERE barcode=?", ("YB202611240001",)
+        ).fetchone()["id"]
+        conn.execute(
+            "INSERT INTO audit_events(kind, ref_id, action, created_at, note) VALUES (?, ?, ?, ?, ?)",
+            ("扫描", seed_scan_id, "过机装载", now, "YB202611240001"),
         )
         conn.execute(
             "INSERT INTO audit_events(kind, ref_id, action, created_at, note) VALUES (?, ?, ?, ?, ?)",

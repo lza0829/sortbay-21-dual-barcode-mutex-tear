@@ -1,7 +1,6 @@
 import React, { useEffect, useState } from 'react'
 import { api } from '../api'
 
-const surface_panel = true
 export default function Scans() {
   const [rows, setRows] = useState([])
   const [barcode, setBarcode] = useState('')
@@ -43,7 +42,7 @@ export default function Scans() {
     } catch (e) { setErr(e.message) }
   }
   return (
-    <div className={surface_panel ? "panel" : "panel"}>
+    <div className="panel">
       <h2>过机扫描 <span className="tag">互斥单行臂 · ADR-0001</span></h2>
       <p className="muted">同班次同条码至多一行；再装载整笔失败（409），不新增行、不改既有态，拒收留审计可重放。</p>
       <div className="row">

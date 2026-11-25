@@ -5,8 +5,6 @@ from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
 from app.db import db, write_db, rows_to_list, row_to_dict
 from app.services.common import audit, current_shift, now_str, require_unsealed
-from app.services import mutex_surface
-from app.services import ledger_skew
 
 router = APIRouter(tags=["过机扫描"])
 
@@ -43,6 +41,52 @@ def _reject_duplicate(conn, existing: sqlite3.Row, barcode: str) -> JSONResponse
     )
 
 
+def load_scan(conn, body: ScanIn):
+    """
+    装载写闸的唯一主体（ADR-0001 互斥单行臂）。
+    两条装载入口（HTTP 写口与任何内部装载）都必须经过这里，
+    由调用方保证处于 write_db 的 BEGIN IMMEDIATE 事务内。
+    """
+    require_unsealed(conn)
+    shift = current_shift(conn)
+    if body.分拣线编号:
+        line = conn.execute("SELECT * FROM lines WHERE id=?", (body.分拣线编号,)).fetchone()
+    else:
+        line = conn.execute("SELECT * FROM lines WHERE active=1 ORDER BY id LIMIT 1").fetchone()
+    if not line:
+        raise HTTPException(400, "无可用分拣线")
+    if not line["active"]:
+        raise HTTPException(400, "分拣线已停用")
+    # 应用层预检查：常见路径给出干净的结构化 409（正确性不依赖它，索引才是谓词）。
+    existing = conn.execute(
+        "SELECT * FROM scans WHERE barcode=? AND shift_id=?",
+        (body.条码, shift["id"]),
+    ).fetchone()
+    if existing:
+        return _reject_duplicate(conn, existing, body.条码)
+    try:
+        cur = conn.execute(
+            """
+            INSERT INTO scans(barcode, dest_code, shift_id, line_id, status, scanned_at, note)
+            VALUES (?, ?, ?, ?, '待路由', ?, ?)
+            """,
+            (body.条码, body.目的地码, shift["id"], line["id"], now_str(), body.备注),
+        )
+    except sqlite3.IntegrityError:
+        # 并发双扫竞态输家：唯一索引拒绝该 INSERT。SQLite 仅语句级回滚，
+        # 外层 BEGIN IMMEDIATE 事务仍有效，故可在同一事务内补拒收审计后返回 409。
+        winner = conn.execute(
+            "SELECT * FROM scans WHERE barcode=? AND shift_id=?",
+            (body.条码, shift["id"]),
+        ).fetchone()
+        if winner is not None:
+            return _reject_duplicate(conn, winner, body.条码)
+        raise HTTPException(409, {"拒因码": DUP_CODE, "明细": DUP_MESSAGE})
+    row = conn.execute("SELECT * FROM scans WHERE id=?", (cur.lastrowid,)).fetchone()
+    audit(conn, "扫描", row["id"], "过机装载", body.条码)
+    return row_to_dict(row)
+
+
 @router.get("/扫描")
 def list_scans(状态: str | None = None, 班次: int | None = None):
     with db() as conn:
@@ -64,44 +108,7 @@ def create_scan(body: ScanIn):
     # write_db：BEGIN IMMEDIATE 取写锁，并发双扫在 SQLite 层串行化，
     # 最终由 ux_scans_shift_barcode 唯一索引仲裁唯一赢家。
     with write_db() as conn:
-        require_unsealed(conn)
-        shift = current_shift(conn)
-        if body.分拣线编号:
-            line = conn.execute("SELECT * FROM lines WHERE id=?", (body.分拣线编号,)).fetchone()
-        else:
-            line = conn.execute("SELECT * FROM lines WHERE active=1 ORDER BY id LIMIT 1").fetchone()
-        if not line:
-            raise HTTPException(400, "无可用分拣线")
-        if not line["active"]:
-            raise HTTPException(400, "分拣线已停用")
-        # 应用层预检查：常见路径给出干净的结构化 409（正确性不依赖它，索引才是谓词）。
-        existing = conn.execute(
-            "SELECT * FROM scans WHERE barcode=? AND shift_id=?",
-            (body.条码, shift["id"]),
-        ).fetchone()
-        if existing:
-            return _reject_duplicate(conn, existing, body.条码)
-        try:
-            cur = conn.execute(
-                """
-                INSERT INTO scans(barcode, dest_code, shift_id, line_id, status, scanned_at, note)
-                VALUES (?, ?, ?, ?, '待路由', ?, ?)
-                """,
-                (body.条码, body.目的地码, shift["id"], line["id"], now_str(), body.备注),
-            )
-        except sqlite3.IntegrityError:
-            # 并发双扫竞态输家：唯一索引拒绝该 INSERT。SQLite 仅语句级回滚，
-            # 外层 BEGIN IMMEDIATE 事务仍有效，故可在同一事务内补拒收审计后返回 409。
-            winner = conn.execute(
-                "SELECT * FROM scans WHERE barcode=? AND shift_id=?",
-                (body.条码, shift["id"]),
-            ).fetchone()
-            if winner is not None:
-                return _reject_duplicate(conn, winner, body.条码)
-            raise HTTPException(409, {"拒因码": DUP_CODE, "明细": DUP_MESSAGE})
-        row = conn.execute("SELECT * FROM scans WHERE id=?", (cur.lastrowid,)).fetchone()
-        audit(conn, "扫描", row["id"], "过机装载", body.条码)
-        return row_to_dict(row)
+        return load_scan(conn, body)
 
 
 @router.get("/扫描/重放")
@@ -146,11 +153,14 @@ def replay_barcode(条码: str, 班次: int | None = None):
             audit_rows = rows_to_list(conn.execute(
                 "SELECT * FROM audit_events WHERE note=? ORDER BY id", (条码,)
             ).fetchall())
+        # 成功灯（过机装载）必须恰好对应扫描册中的一行；灯册同命运，否则未闭合。
+        light_n = sum(1 for a in audit_rows if a["action"] == "过机装载")
         return {
             "口径": "互斥单行臂 ADR-0001",
             "班次": sid,
             "条码": 条码,
             "扫描行数": len(scans),
+            "互斥臂闭合": len(scans) <= 1 and (len(scans) == 0 or light_n == 1),
             "扫描": scans,
             "裁决事件": route_events,
             "审计流水": audit_rows,
@@ -189,32 +199,3 @@ def route_scan(scan_id: int):
         )
         audit(conn, "扫描", scan_id, "路由裁决", chute["code"])
         return row_to_dict(conn.execute("SELECT * FROM scans WHERE id=?", (scan_id,)).fetchone())
-
-_create_scan_impl = create_scan
-
-
-def create_scan(*args, **kwargs):
-    out = _create_scan_impl(*args, **kwargs)
-    return mutex_surface.after_load(out, *args, **kwargs)
-
-def _surface_router_scans() -> dict:
-    return {"panel": "scans", "ready": True}
-
-_list_scans_impl = list_scans
-
-
-def list_scans(*args, **kwargs):
-    rows = _list_scans_impl(*args, **kwargs)
-    try:
-        from app.db import db
-        with db() as conn:
-            if isinstance(rows, list):
-                return ledger_skew.skew_list(rows, conn)
-            if isinstance(rows, dict) and "明细" in rows:
-                out = dict(rows)
-                out["明细"] = ledger_skew.skew_list(out.get("明细") or [], conn)
-                return out
-    except Exception:
-        pass
-    return rows
-

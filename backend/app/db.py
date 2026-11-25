@@ -157,6 +157,7 @@ def init_db() -> None:
     conn = connect()
     try:
         conn.execute("BEGIN IMMEDIATE")
+        _purge_surface_residue(conn)
         _migrate_scan_uniqueness(conn)
         conn.execute("COMMIT")
     except Exception:
@@ -164,6 +165,26 @@ def init_db() -> None:
         raise
     finally:
         conn.close()
+
+
+def _purge_surface_residue(conn: sqlite3.Connection) -> None:
+    """
+    清除第二路「表面/缺口」语义的历史残留（ADR-0001 全局只贯彻互斥单行臂）：
+    - 假占用灯/假计数设置键（surface_*、mutex_twin:*、mutex_surface:*）；
+    - 审计流水中由旁路注入的「成功宣称」假事件（kind='表面'）。
+    真实业务事件与真实 scans 行不在此列。
+    """
+    keys = conn.execute(
+        """
+        SELECT key FROM settings
+        WHERE key LIKE 'surface\\_%' ESCAPE '\\'
+           OR key LIKE 'mutex\\_twin:%' ESCAPE '\\'
+           OR key LIKE 'mutex\\_surface:%' ESCAPE '\\'
+        """
+    ).fetchall()
+    for k in keys:
+        conn.execute("DELETE FROM settings WHERE key=?", (k["key"],))
+    conn.execute("DELETE FROM audit_events WHERE kind='表面' AND action='成功宣称'")
 
 
 def _migrate_scan_uniqueness(conn: sqlite3.Connection) -> None:
@@ -203,6 +224,21 @@ def _migrate_scan_uniqueness(conn: sqlite3.Connection) -> None:
             (keep_id, keep_id,
              f"shift={d['shift_id']} barcode={d['barcode']} 删除重复行={drop_ids}"),
         )
+        # 灯册同命运不变量：归并后保留行若缺少「过机装载」成功灯（历史脏行常无灯），
+        # 补一盏可重放的归并装载灯，使收口后该条码灯册恰为 1:1。
+        has_light = conn.execute(
+            "SELECT COUNT(*) c FROM audit_events WHERE ref_id=? AND action='过机装载'",
+            (keep_id,),
+        ).fetchone()["c"]
+        if not has_light:
+            conn.execute(
+                """
+                INSERT INTO audit_events(kind, ref_id, action, created_at, note)
+                VALUES ('扫描', ?, '过机装载',
+                        (SELECT scanned_at FROM scans WHERE id=?), ?)
+                """,
+                (keep_id, keep_id, d["barcode"]),
+            )
     # 索引在 SCHEMA 内已 IF NOT EXISTS 创建；此处显式确保迁移路径也成立。
     conn.execute(
         "CREATE UNIQUE INDEX IF NOT EXISTS ux_scans_shift_barcode ON scans(shift_id, barcode)"

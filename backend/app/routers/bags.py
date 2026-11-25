@@ -1,6 +1,6 @@
 from __future__ import annotations
 from fastapi import APIRouter, HTTPException
-from pydantic import BaseModel, Field
+from pydantic import BaseModel
 from app.db import db, write_db, rows_to_list, row_to_dict
 from app.services.common import audit, current_shift, now_str, require_unsealed
 
@@ -97,7 +97,4 @@ def seal_bag(bag_id: int):
         )
         audit(conn, "封袋", bag_id, "封口", f"件数{n}")
         return row_to_dict(conn.execute("SELECT * FROM bags WHERE id=?", (bag_id,)).fetchone())
-
-def _surface_router_bags() -> dict:
-    return {"panel": "bags", "ready": True}
 

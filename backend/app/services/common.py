@@ -1,7 +1,6 @@
 from __future__ import annotations
 from datetime import datetime
 from fastapi import HTTPException
-from app.db import db, row_to_dict
 
 
 def now_str() -> str:

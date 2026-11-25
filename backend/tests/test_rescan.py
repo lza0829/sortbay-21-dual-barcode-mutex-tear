@@ -88,29 +88,18 @@ def test_concurrent_double_scan_half_commit_single_winner(client):
 
     def worker():
         try:
-            conn = connect()
+            from fastapi.responses import JSONResponse
             from app.db import write_db
-            from app.services.common import require_unsealed, current_shift, now_str
+            from app.routers.scans import load_scan, ScanIn
             barrier.wait()  # 尽量让两个事务同时撞上
             with write_db() as conn:
-                require_unsealed(conn)
-                shift = current_shift(conn)
-                line = conn.execute(
-                    "SELECT * FROM lines WHERE active=1 ORDER BY id LIMIT 1"
-                ).fetchone()
-                # 模拟装载入口主体：不做应用层预检，直接 INSERT，压测唯一索引仲裁
-                try:
-                    conn.execute(
-                        """
-                        INSERT INTO scans(barcode, dest_code, shift_id, line_id,
-                                          status, scanned_at, note)
-                        VALUES (?, ?, ?, ?, '待路由', ?, '')
-                        """,
-                        (BARCODE, "110", shift["id"], line["id"], now_str()),
-                    )
+                # 两路装载口共用唯一写闸主体：在 BEGIN IMMEDIATE 事务内装载，
+                # 由 ux_scans_shift_barcode 仲裁唯一赢家，输家转 409 拒收。
+                out = load_scan(conn, ScanIn(条码=BARCODE, 目的地码="110"))
+                if isinstance(out, JSONResponse) and out.status_code == 409:
+                    results.append("rejected:duplicate_in_shift")
+                else:
                     results.append("committed")
-                except Exception as e:  # noqa: BLE001
-                    results.append(f"rejected:{type(e).__name__}")
         except Exception as e:  # noqa: BLE001
             errors.append(e)
 
@@ -120,8 +109,8 @@ def test_concurrent_double_scan_half_commit_single_winner(client):
     t1.join(15); t2.join(15)
     assert not errors, errors
 
-    # 恰好一个赢家
-    assert sorted(results) == ["committed", "rejected:IntegrityError"]
+    # 恰好一个赢家（输家由唯一索引转结构化 409 拒收，不产生行）
+    assert sorted(results) == ["committed", "rejected:duplicate_in_shift"]
 
     # 半截回滚后同码行数为 1 —— 由扫描册行数重放
     book = _scan_book(client)
@@ -188,8 +177,6 @@ def test_rescan_after_routed_still_rejected_and_state_untouched(client):
     assert book[0]["chute_id"] == chute_after_route
 
     # 口门页：在口件数仍为 1，拒扫没有抢入口门
-    chutes = client.get("/口门").json()
-    target = next(c for c in chutes if c["id"] == chute_after_route)
     overview = client.get("/总览").json()
     oc = next(c for c in overview["口门"] if c["id"] == chute_after_route)
     assert oc["在口件数"] == 1
